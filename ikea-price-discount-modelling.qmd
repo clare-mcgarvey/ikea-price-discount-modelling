@@ -1,0 +1,1810 @@
+---
+title: "IKEA Pricing and Drivers of Discounts"
+format: 
+  html:
+    embed-resources: true
+editor: visual
+---
+
+## Set-up
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(dplyr)
+library(DataExplorer)
+library(corrplot)
+library(caret)
+library(mctest)
+library(car)
+library(Metrics)
+library(pROC)
+library(stringdist)
+library(car)
+library(ggplot2)
+library(tidyr)
+library(grid)
+library(purrr)
+options(scipen = 999)
+```
+
+```{r load-data}
+ikea_original <- read_csv(file = "data/ikea_data.csv")
+head(ikea_original)
+```
+
+## Tidying
+
+```{r removing-identifiers}
+ikea_tidy <- ikea_original |> 
+  select(-c(item_id, link))
+```
+
+### Designer 
+
+The feature 'designer' contains 381 different possible values, some of which are descriptions of the item rather than the name of the designer. Designer collaborations whose names are listed in alternative orders will be alphabetised for standardisation. Entries containing descriptions rather than names will be recoded as 'Unknown'. 
+
+```{r designers}
+# Number of desiners
+length(unique(ikea_tidy$designer))
+
+# Designers grouped 
+# sort(table(ikea_original$designer), decreasing = TRUE)
+```
+
+```{r designer-checks}
+ikea_tidy |>
+  distinct(designer) |>
+  mutate(
+    canonical = designer |>
+      str_split("/") |>
+      map_chr(\(x) paste(sort(str_trim(x)), collapse = "/"))
+  ) |>
+  group_by(canonical) |>
+  filter(n() > 1) |> 
+  arrange(canonical)
+
+# Descriptions check
+ikea_tidy |>
+  count(designer) |>
+  filter(str_length(designer) > 65 | str_detect(designer, "\\d")) |>
+  arrange(desc(n))
+```
+
+```{r cleaning-designer}
+ikea_tidy <- ikea_tidy |>
+  mutate(
+    designer = designer |>
+      str_split("/") |>
+      map_chr(\(x) paste(sort(str_trim(x)), collapse = "/")),
+    designer = if_else(str_length(designer) > 65 | str_detect(designer, "\\d"),
+                       "Unknown", designer)
+  )
+
+n_distinct(ikea_tidy$designer) 
+```
+
+### Old Price
+
+The variable 'old_price' lists either the old price of the item in Saudi Riyals or says 'No old price'. This latter value will be converted to NA and the feature will be converted to numerical type. Since old_price is used only to construct the discount target, not as a predictor, these NAs do not cause any observations to be dropped. Additionally, some values list the price per quantity, for these the quantity will be removed to isolate the price. A binary feature will be added, conveying whether an item has been discounted or not, which is used as the classification target. 
+
+```{r old-price-inspect}
+ikea_original |>
+  filter(old_price != "No old price",
+         is.na(as.numeric(str_remove_all(old_price, "SR|,|\\s")))) |>
+  select(price, old_price)
+```
+
+```{r old-price-clean}
+ikea_tidy <- ikea_tidy |>
+  mutate(
+    old_price = na_if(old_price, "No old price"),
+    old_price = str_remove(old_price, "/.*"),
+    old_price = as.numeric(str_remove_all(old_price, "SR|,|\\s")),
+    discounted = factor(!is.na(old_price) & old_price > price,
+                        labels = c("no", "yes"))
+  )
+```
+
+## Exploratory Data Analysis
+
+```{r basic-exploratory-analysis}
+str(ikea_tidy)
+plot_intro(ikea_tidy)
+introduce(ikea_tidy)
+```
+The data set is comprised of 3,694 observations and 12 variables of numerical, character and logical types. The majority of variables are categorical (such as name, category, designer, short description) and the numeric variables are continuous: price and old price (in Saudi riyals), and the three dimensions (in centimetres).
+
+### Continuous Variables
+
+```{r exploratory-plots}
+# Summaries
+summary(ikea_tidy)
+
+# Histogram of Continuous Variables
+plot_histogram(ikea_tidy)
+
+# Density Plot
+plot_density(ikea_tidy)
+
+# Scatterplot of price with all other continuous features
+plot_scatterplot(split_columns(ikea_tidy)$continuous, by = "price")
+
+## Quantile-Quantile Plot
+plot_qq(ikea_tidy)
+```
+
+The price of items ranges from 3 to 9585 SR, with a median of 544.70 and a mean of 1078.20 SR. The density and Q-Q plots show that none of the continuous variables are normally distributed. All are right-skewed and depth, height and width are also multimodal. In all the Q-Q plots, although height and depth have partial linearity, there is substantial variation from the linear trend line indicating non-normality of the data. Height and depth follow the Q-Q reference line in a section of their range, but all four variables deviate from it substantially in their tails. 
+
+The scatterplots show a positive relationship between price and each dimension. Depth and height cluster strongly at certain values: occurring around 60, 100 and 160 cm for depth, and around 100 and 120 cm for height. Width clusters only weakly. This aligns with standardised sizing expected of mass-produced furniture. Price varies widely within each cluster, indicating size alone will not be able to predict the price. Among products with a previous price, price and old price have a strong linear relationship, which is expected as discounts are generally applied as a percentage of the original price.
+
+### Bi-variate Analysis
+
+Numeric features by category
+
+```{r bivariate-plots}
+# Boxplots per category
+plot_boxplot(ikea_tidy, by = "category")
+
+# Bar Charts 
+plot_bar(ikea_tidy, by = 'category')
+
+ggplot(ikea_tidy, aes(x = fct_infreq(category))) +
+  geom_bar() +
+  coord_flip() +
+  labs(
+    title = "Product Categories",
+    x = "Category",
+    y = "Count")
+
+ikea_tidy |>
+  ggplot(aes(x = sellable_online)) +
+  geom_bar() +
+  coord_flip() +
+  labs(
+    title = "Products Sellable Online",
+    x = "Sellable Online",
+    y = "Count")
+
+ikea_tidy |>
+  ggplot(aes(x = other_colors)) +
+  geom_bar() +
+  coord_flip() +
+  labs(
+    title = "Products Available in Other Colors",
+    x = "Other Colours",
+    y = "Count")
+```
+
+The boxplots show there are differences in the distribution of price, and all three dimensions across product categories, indicating category is an important predictor. Most categories contain notable outliers, especially in price, which is consistently right-skewed across categories. This probably reflects the presence of a small number of premium products. Tables & desks are the most common category, followed by bookcases & shelving units, and then chairs. Almost all products are sellable online, and most are exclusively available in one colour. 
+
+These findings motivate two modelling choices: 1) log-transforming price and the dimensions to reduce skew, and 2) treating sellable_online as possessing little predictive value due to its near-zero variance. 
+
+### Correlation analysis
+
+```{r correlation}
+# heatmap visualisation
+plot_correlation(ikea_tidy |> select(-old_price, -name, -short_description))
+
+# get explanatory variables
+expVar <- ikea_tidy[c("price", "depth", "height", "width")]
+
+# correlation matrix
+corMatrix <- round(cor(expVar), 2)
+corrplot(corMatrix, method="number")
+
+# Spearmans correlation
+cor(expVar, method = "spearman")
+```
+Price is positively correlated with all three dimensions. Pearson's correlation is strongest for width (r = 0.70), followed by depth (r = 0.65), and a moderate correlation with height (r = 0.36). As the variables are right-skewed, Spearman's rank correlation was also calculated, The ordering is the same, and whilst the results are similar to Pearson's for width (ρ = 0.76) and depth (ρ = 0.64), height is considerably higher (ρ = 0.61). This indicates height is related to price non-linearly and supports log-transforming the variables prior to modelling. Among the product categories, sofas & armchairs and wardrobes are weakly positively correlated with price, while bookcases & shelving units is weakly negatively correlated. 
+
+Other correlations present are intuitive. Height is strongly correlated with wardrobes, and width is positively associated with both depth and height. These relationships between the dimensions suggest potential multicollinearity, tested in the modelling stage. 
+
+### Discounts 
+
+```{r discounted-eda}
+# Class imbalance
+ikea_tidy |> count(discounted) |> mutate(pct = round(100 * n / sum(n), 2))
+
+# Discount rate by category
+ikea_tidy |>
+  group_by(category) |>
+  summarise(pct_discounted = mean(discounted == "yes") * 100) |>
+  arrange(desc(pct_discounted))
+
+# Price/size by discount status
+plot_boxplot(ikea_tidy |> select(price, width, height, depth, discounted),
+             by = "discounted")
+```
+
+The majority (82.30%) of items have not been discounted. Chests of drawers & drawer units were the most discounted category (42.40%) followed by Room dividers (38.46%) and Wardrobes (34.75%). 
+
+### Designer
+
+IKEA of Sweden is the most common designer of products. 
+
+```{r}
+ikea_tidy |>
+  count(designer, sort = TRUE) |>
+  slice_head(n = 1)
+```
+
+### Summary EDA
+
+```{r report-eda}
+# separate report
+create_report(ikea_tidy)
+```
+
+## Data Preparation
+
+### Missing Values
+
+The only variable with missing values is old price, which contains NAs for items with no previous price (82.30%). This is expected and rectified through the construction of the discount target (see Tidying). 
+
+### Outliers
+
+No outliers will be removed as they represent real products and real prices. Removing them would bias the model.
+
+### Encoding
+
+All categorical and logical features are converted to factors, encoding each factor with k levels as k-1 dummy variables relative to a reference level. Each coefficient therefore represents the difference from the reference level, holding other variables constant. The most frequent category (Tables & desks), and designer (IKEA of Sweden) are set as the reference to enable comparisons against the most common items. 
+
+```{r encoding}
+ikea_model <- ikea_tidy |> 
+  mutate(
+    category = as.factor(category),
+    designer = as.factor(designer),
+    other_colors = as.factor(other_colors),
+    sellable_online = as.factor(sellable_online),
+    category = fct_relevel(category, "Tables & desks"), 
+    designer = fct_relevel(designer, "IKEA of Sweden")
+  )
+
+mm <- model.matrix(price ~ category, data = ikea_model)
+mm[c(1, 100, 500, 1000), 1:6]
+ikea_model$category[c(1, 100, 500, 1000)] 
+```
+
+### Scaling
+
+Features are standardised (scaled and centred) within the caret training process. 
+
+### Designer Lumping
+
+The feature 'designer' contains 200 different possible values. To reduce the number of levels, the 20 most-frequent designers (22 due to ties at the cutoff) will be explicitly named and kept as dummy variables in the model, and the rest will be classified as "Other". This gives 23 overall levels including Other. The level of 20 was selected by comparing 5 to 30 designers using 10-fold cross-validation on the full dataset. RMSE decreased steadily with more designers, continuing to rise after 20 but with decreasing returns, so 20 was selected to balance predictive performance and model simplicity. 
+
+```{r k-designers}
+compare_lumps <- map_dfr(c(5, 10, 15, 20, 25, 30), \(k) {
+  d <- ikea_tidy |>
+    mutate(designer = fct_lump_n(designer, n = k)) |>
+    select(price, depth, width, height, category, designer, other_colors)
+  set.seed(1234)
+  fit <- train(price ~ ., data = d, method = "lm",
+               trControl = trainControl("cv", number = 10))
+  tibble(k = k, RMSE = fit$results$RMSE, R2 = fit$results$Rsquared)
+})
+compare_lumps
+```
+
+
+```{r top-20-designers}
+ikea_model <- ikea_model |> 
+  mutate(
+    designer = fct_lump_n(designer, n = 20)
+  )
+ikea_model |>
+  count(designer, sort = TRUE) |>
+  mutate(percent = round(100 * n / sum(n), 1)) |>
+  print(n = Inf)
+
+nlevels(ikea_model$designer)
+```
+
+### Feature Generation
+
+Due to the consistent right-skew and the non-linear relationship suggested by the Spearman vs Pearson correlation differences for height, predictors price, width, height and depth are log-transformed. Additionally, a volume variable is created to capture the overall size of a product in a single measure, as price may depend on this rather than a single dimension. Volume is highly correlated with the individual dimensions. 
+
+```{r feature-generation}
+ikea_model <- ikea_model |> 
+  mutate(
+    volume = depth * height * width,
+    log_price = log(price),
+    log_width = log(width),
+    log_height = log(height),
+    log_depth = log(depth)
+  )
+```
+
+### Feature Selection
+
+Columns in the data set that are not useful for model analysis will be removed. These are the name and short description columns. These are free-text fields with hundreds of unique values and no consistent structure to model. 
+
+Old price is removed from the dataset used to train the regression model, as it contains over 3000 NAs and running the model would automatically exclude all of these values, training it only on discounted observations. The derived variable 'discounted' will also be removed as it is built from the outcome variable price. 
+
+```{r feature-selection}
+ikea_model <- ikea_model |> 
+  select(-c(name, short_description)) 
+
+# Data set for the linear model
+ikea_linear <- ikea_model |>
+  select(-old_price, -discounted)
+```
+
+### Training and Testing
+
+Linear model
+
+```{r train-test}
+# Splitting the data into test and train segments 
+set.seed(1234)
+
+training.samples.linear <- ikea_linear$price |>
+  createDataPartition(y = _, p = 0.8, list = FALSE)
+
+train.data.linear <- ikea_linear[training.samples.linear, ]
+test.data.linear  <- ikea_linear[-training.samples.linear, ]
+```
+
+Regularisation: cross-fold validation
+
+```{r control-helper}
+ctrl <- trainControl(
+  method = "cv",
+  number = 10)
+```
+
+## Model 1: Predicting Price
+
+### Linear Model
+
+As the target variable (price) is continuous, I will look at regression models to find the best prediction. First, a basic linear regression will be run to serve as the baseline. The feature `sellable_online` is excluded from the baseline model as it has near-zero variance (only 0.76% of items are not sellable online). Therefore, it provides little information and has an unstable estimate. It is retained in the full model and the regularised models (where the penalty can shrink it if it does not contribute).
+
+```{r linear-model}
+set.seed(1234)
+
+linear_model <- lm(price ~ depth + width + height + category + designer + other_colors,
+                   data = train.data.linear)
+
+summary(linear_model)
+```
+
+Holding all other variables constant, price increases by approximately 19.0 SR for each additional centimetre of depth, 9.3 SR per centimetre of width and 1.8 SR per centimetre of height.
+
+Relative to 'Tables & desks' of the same size, seven item categories are significantly cheaper: 'Children's furniture' (−372 SR), 'Bar furniture' (−326 SR), 'Outdoor furniture' (−323 SR), 'Nursery furniture' (−294 SR), 'Bookcases & shelving units' (−244 SR), 'TV & media furniture' (−195 SR) and 'Beds' (−153 SR). No category is significantly more expensive, and the remaining nine are not significantly different. 
+
+Compared with products designed exclusively by IKEA of Sweden, several designers command a significant premium in price including Ehlén Johansson/IKEA of Sweden (+883 SR), E Lilja Löwenhielm/K Malmvall (+767 SR) and IKEA of Sweden/Marcus Arvonen (+696 SR). Designers grouped together as 'Other' are also significantly more expensive (+407 SR). Johan Kroon is the only designer whose products are significantly cheaper (−542 SR), and the remaining designers, including those unknown, are not significantly different from IKEA of Sweden. Items that are available in other colours are cheaper than those that are not (-144 SR).
+
+#### Multicollinearity
+
+```{r multicollinearity}
+omcdiag(linear_model) # overall multicollinearity
+imcdiag(linear_model) # individual multicollinearity
+```
+
+Two of the six overall diagnostics (the determinant of X′X and the Farrar–Glauber chi-square test) indicate the presence of multicollinearity, however, both are sensitive to sample size. The remaining four indicate no presence of multicollinearity and all variance inflation factors are below 3. Multicollinearity is therefore low and does not substantially affect the interpretation of the coefficients. 
+
+#### Linearity
+
+```{r residuals-vs-fitted}
+plot(linear_model, 1)
+```
+
+The residual vs fitted plot shows a slightly curved trendline, indicating the model is not best approximated linearly (a random scatter of points around the horizontal axis at zero would suggest linearity). The variance also appears to increase as the fitted values increase, indicating heteroscedasticity. There is a high density of points at the lower-price end, due to the predominance of low to mid-priced products. 
+
+#### Normality of residuals
+
+```{r normality-residuals}
+plot(linear_model, 2)
+```
+
+The points are predominantly aligned along the diagonal reference line in the middle of the range, however, there are significant deviations at both ends. A Shapiro Wilk test will be performed to test this normality statistically.
+
+H0: data is normally distributed 
+H1: data is not normally distributed
+
+```{r normality-test}
+shapiro.test(linear_model$residuals)
+```
+
+As the p-value is less than 0.05, we reject the null hypothesis and conclude that the assumption of normality of the residuals does not hold in this model.
+
+#### Homoscedasticity
+
+```{r heteroscedasticity}
+plot(train.data.linear$price, linear_model$fitted.values)
+ncvTest(linear_model)
+```
+
+As noted above, there appears to be a slight funnel shape, with variance increasing as the price increases. This supports the decision to log-transform price. 
+
+As the p-value is less than 0.05, we reject the null hypothesis and conclude that the residuals are indeed heteroscedastic, violating an assumption of the linear model.
+
+#### Independence
+
+Independence cannot be properly tested for cross-sectional data. Independence may be violated for items that are part of a set. For example, items from the same collection or designer may share unobserved characteristics which would violate the independence assumption. 
+
+#### Evaluation
+
+```{r linear-eval}
+# Predicted values
+pred_linear <- predict(linear_model, newdata = test.data.linear)
+
+# Predicted vs Actual Plot
+plot(
+  test.data.linear$price,
+  pred_linear,
+  xlab = "Actual Price",
+  ylab = "Predicted Price",
+  main = "Linear Model: Predicted vs Actual Prices"
+)
+abline(a = 0, b = 1, col = "red")
+
+# Test vs Train
+pred_train <- predict(linear_model, newdata = train.data.linear)
+pred_test  <- predict(linear_model, newdata = test.data.linear)
+
+tibble(
+  Set  = c("Train", "Test"),
+  RMSE = c(RMSE(pred_train, train.data.linear$price),
+           RMSE(pred_test,  test.data.linear$price)),
+  MAE  = c(MAE(pred_train, train.data.linear$price),
+           MAE(pred_test,  test.data.linear$price)),
+  R2   = c(R2(pred_train, train.data.linear$price),
+           R2(pred_test,  test.data.linear$price))
+) |>
+  mutate(across(where(is.numeric), \(x) round(x, 3)))
+
+# Negative price predictions
+sum(pred_linear < 0)
+```
+
+On the test set, the linear model has an RMSE of 821 SR and MAE of 539 SR, showing that typical prediction errors are large relative to the average price of 1,078 SR (and the median price of 545 SR). The model explains 67.8% of the variation in test-set price. The predicted vs actual plot shows under-prediction of items costing around 2,500 SR or more, and a widening of predicted prices around the line as actual price increases, consistent with the heteroscedasticity identified earlier.
+
+The training and test performances are similar (training RMSE = 767 SR, R² = 0.680), so there is no evidence of overfitting. The model predicts that 102 items will have a negative price, which is an obvious error. 
+
+### Log-Transformed Model
+
+As three assumptions of a linear model are not met in the baseline model (linearity, normality of the residuals, homoscedasticity), a model using transformed features is trained.
+
+In order to improve the model, log transformations of price, width, height, depth will be included as well as the generated feature volume. This should help to improve the model's assumptions.
+
+```{r log-linear}
+set.seed(777)
+
+linear_model_log <- lm(log_price ~ 
+                         log_depth + log_width + log_height + volume +
+                         category + designer + other_colors,
+                       data = train.data.linear)
+
+summary(linear_model_log)
+```
+
+This model explains around 77% of variation in log price (R² = 0.768), and is highly significant overall (F-stat = 224.3, p-value < 0.001). The residual standard error reveals that individual predictions are off by a factor of around 2 (exp(0.72) ≈ 2.05),  indicating that the model is fairly good at capturing pricing patterns but imprecise at predicting individual item prices. 
+
+Item size is still an important predictor of price, with the log transformations of depth, width and height all significant, although cannot be individually interpreted as it is impossible to hold all other variables constant when volume is included as a feature. Volume is non-significant at the 5% significance level. 
+
+Compared to the reference category of 'Tables & desks' for an item of the same dimensions (calculated as (e^β − 1) × 100%), 'Children's furniture' is 55% cheaper, 'Nursery furniture' is 47% cheaper, 'Outdoor furniture' is 45% cheaper, 'Bookcases & shelving units' is 43% cheaper, 'TV & media furniture' is 41% cheaper and 'Wardrobes' are 37% cheaper. 'Bar furniture', 'Cabinets & cupboards' and 'Chairs' are between 22 and 30% cheaper, and the remaining categories are not significantly different in price from the reference. 
+
+Compared to the reference designer IKEA of Sweden, all other significant designers create products which are higher in price. The most premium designers are IKEA of Sweden/Marcus Arvonen, whose products are around 158% more expensive than the reference, Carina Bengs, whose products are around 110% more, and Ehlén Johansson/IKEA of Sweden, whose products are around 103% more. 'Other' designers have items around 70% more than the standard IKEA-designed products. 
+
+In this model, whether an item is available in another colour has no significant effect on the price. 
+
+#### Testing Assumptions
+
+```{r log-multicollinearity}
+# Testing multicollinearity
+omcdiag(linear_model_log) # overall multicollinearity
+imcdiag(linear_model_log) # individual multicollinearity
+```
+
+Three of the six overall diagnostics (the determinant of |X'X|, the Farrar–Glauber chi-square and the condition number) indicate the presence of multicollinearity, however, all VIFs remain under 2.5, well under the common threshold of 5. Multicollinearity is therefore low in this model and unlikely to distort coefficient estimates. 
+
+```{r log-linearity}
+# Linearity
+plot(linear_model_log, 1)
+
+# Extreme values
+train.data.linear |>
+  mutate(fitted = fitted(linear_model_log),
+         resid  = resid(linear_model_log)) |>
+  filter(fitted < 2.5 | abs(resid) > 3) |>
+  select(category, designer, width, height, depth, price, fitted, resid) |>
+  arrange(fitted)
+
+# Heteroscedasticity
+ncvTest(linear_model_log)
+```
+
+The residuals vs fitted plot shows an approximately linear fit for most products, however, a distinct group of 17 observations exist to the left of the plot with low fitted values and large positive residuals. These products have at least one dimension of less than 7cm, which the log transformation turns into an extreme value (eg, log(5) ≈ 1.6 vs log(50) ≈ 3.9). The model therefore severely under-predicts their prices. This is a limitation to the model. Some heteroscedasticity remains. 
+
+```{r log-normality}
+# Normality of residuals
+plot(linear_model_log, 2)
+shapiro.test(linear_model_log$residuals)
+```
+
+Whilst the Q-Q plot appears to follow more of a linear trend than the baseline model, a Shapiro-Wilk test confirmed that the residuals are still not normally distributed.
+
+#### Evaluation
+
+```{r}
+# Predictions on the original price scale (SR)
+pred_train_log <- exp(predict(linear_model_log, newdata = train.data.linear))
+pred_test_log  <- exp(predict(linear_model_log, newdata = test.data.linear))
+
+# Predicted vs Actual plot
+plot(test.data.linear$price, pred_test_log,
+     xlab = "Actual Price", ylab = "Predicted Price",
+     main = "Predicted vs Actual Prices (Log-transform)")
+abline(a = 0, b = 1, col = "red", lwd = 2)
+
+# Train vs Test
+tibble(
+  Set  = c("Train", "Test"),
+  RMSE = c(RMSE(pred_train_log, train.data.linear$price),
+           RMSE(pred_test_log,  test.data.linear$price)),
+  MAE  = c(MAE(pred_train_log, train.data.linear$price),
+           MAE(pred_test_log,  test.data.linear$price)),
+  R2   = c(R2(pred_train_log, train.data.linear$price),
+           R2(pred_test_log,  test.data.linear$price))
+) |>
+  mutate(across(where(is.numeric), \(x) round(x, 3)))
+```
+
+On the test set, the log-linear model has an RMSE of 879 SR and a MAE of 469 SR, showing that typical prediction errors remain large relative to the average (1,078 SR) and median (545 SR) prices. Compared with the linear model (RMSE = 821 SR, MAE = 539 SR, R² = 0.678), it has a 13% lower MAE but a 7% higher RMSE and explains less of the variance in prices. This indicates that the log-linear model predicts typical products more accurately but makes a comparatively small number of large errors for expensive items and those with very small dimensions. Similarly to the linear model, the predicted vs actual plot shows under-prediction of expensive items and a widening of spread around the line as actual price increases. 
+
+Training and test performance is similar (training RMSE = 837 SR, R² = 0.640; test RMSE = 879 SR, R² = 0.645) so there is no evidence of overfitting. Unlike the linear model, it cannot produce negative prices.
+
+#### Linear vs Log-Linear
+
+```{r}
+# Helper: all metrics on the original price scale (SR)
+eval_metrics <- function(actual, predicted) {
+  tibble(
+    RMSE = sqrt(mean((actual - predicted)^2)),
+    MAE  = mean(abs(actual - predicted)),
+    R2   = cor(actual, predicted)^2
+  )
+}
+
+actual <- test.data.linear$price
+
+# Predictions on the SR scale
+pred_linear <- predict(linear_model, newdata = test.data.linear)
+pred_log    <- exp(predict(linear_model_log, newdata = test.data.linear))
+
+bind_rows(
+  Linear       = eval_metrics(actual, pred_linear),
+  `Log-linear` = eval_metrics(actual, pred_log),
+  .id = "Model"
+) |>
+  mutate(across(where(is.numeric), \(x) round(x, 3)))
+```
+
+The log-transformed model improves some aspects of the residual diagnostics but does not eliminate the violations of the linear model. The log-transformed model improves on linearity, homoscedasticity and normality of the residuals, however all assumptions remain violated. Independence cannot be properly tested for either due to the nature of cross-sectional data, but could be violated due to shared characteristics of products by the same designer or in the same collection. Multicollinearity remains low in both models. 
+
+On the test set, the linear model explains slightly more of the variance in price (R² = 0.68 vs 0.64) and has a lower RMSE (821 SR vs 879 SR). However, the log-transformed model has a lower MAE (469 SR vs 539 SR). The log model therefore predicts typical products more accurately but makes a small number of very large errors, mainly for products with very small recorded dimensions, which the log transformation turns into extreme values. 
+
+### Linear Model (all features)
+
+The volume feature, the log-transformed dimensions and sellable_online are included in the following models. This introduces multicollinearity in the size features, with VIFs between 6.89 and 12.63 for those variables. 
+
+```{r linear-regression}
+set.seed(777)
+
+linear <- train(
+  price ~ . - log_price,
+  data = train.data.linear,
+  method = 'lm',
+  metric =  "RMSE",
+  trControl = ctrl)
+```
+
+```{r linear-best}
+# Best coefficients
+linear_coefficients <- coef(linear$finalModel)
+linear_coefficients
+```
+
+```{r linear-all-multicollinearity}
+linear_all <- lm(price ~ . - log_price, data = train.data.linear)
+
+omcdiag(linear_all)   # overall multicollinearity
+imcdiag(linear_all)   # individual multicollinearity
+```
+
+### Regularisation
+
+The model includes a number of dummy variables and several correlated size features, regularisation is used to try and find a better-fitting model. ElasticNet, Lasso and Ridge models are run in order to minimise unimportant features (Ridge) and remove any negligible features (ElasticNet and Lasso).
+
+#### Lambda possible values
+
+```{r lambda-values}
+# Sequence of 100 possible lambda values
+lambda <- 10^seq(-3, 3, length = 100)
+```
+
+#### Ridge (alpha = 0)
+
+```{r ridge-regression}
+set.seed(777)
+
+ridge <- train(
+  price ~ . - log_price,
+  data = train.data.linear, 
+  method = "glmnet", 
+  trControl = ctrl, # cross-validation with 10 folds, helper above
+  tuneGrid = expand.grid(alpha = 0, lambda = lambda), # set of lambda values to test, parameter tuning 
+  preProcess = c("center", "scale") # standardising numerical features -> z-score
+)
+```
+
+```{r best-ridge}
+# Best hyper-parameters 
+ridge$bestTune 
+ridge_best_lambda <- ridge$bestTune$lambda
+
+# Best coefficients
+ridge_coefficients <- coef(ridge$finalModel, s = ridge_best_lambda)
+ridge_coefficients
+```
+
+#### Lasso (alpha = 1)
+
+```{r lasso-regression}
+set.seed(777)
+
+lasso <- train(
+  price ~ . - log_price,
+  data = train.data.linear, 
+  method = "glmnet",
+  trControl = ctrl,
+  tuneGrid = expand.grid(alpha = 1, lambda = lambda),
+  preProcess = c("center", "scale")
+)
+```
+
+```{r best-lasso}
+# Best hyper-parameters 
+lasso$bestTune 
+lasso_best_lambda <- lasso$bestTune$lambda
+
+# Best coefficients
+lasso_coefficients <- coef(lasso$finalModel, s = lasso_best_lambda)
+lasso_coefficients
+```
+
+#### ElasticNet
+
+Here, alpha will vary between 0 and 1, allowing Elastic Net to balance Ridge and Lasso.
+
+Elastic Net is tuned over 11 values of α (0 to 1 in steps of 0.1) and the same 100 values of λ used for Ridge and Lasso, giving 1,100 combinations evaluated by cross-validation.
+
+```{r elasticnet-regression}
+set.seed(777)
+
+elastic <- train(
+  price ~ . - log_price,
+  data = train.data.linear,
+  method = "glmnet",
+  trControl = ctrl,
+  tuneGrid = expand.grid(alpha  = seq(0, 1, by = 0.1),
+                         lambda = lambda),       # same 0.001–1000 grid
+  preProcess = c("center", "scale")
+)
+```
+
+```{r best-elastic}
+# Best hyper-parameters 
+elastic$bestTune 
+elastic_best_lambda <- elastic$bestTune$lambda
+
+# Best coefficients
+elastic_coefficients <- coef(elastic$finalModel, s = elastic_best_lambda)
+elastic_coefficients
+```
+
+#### Distributions
+
+```{r regularisation-dist}
+models <- list(ridge = ridge, 
+               lasso = lasso, 
+               elastic = elastic, 
+               linear = linear)
+
+resamples(models) |> summary()
+```
+
+#### Predictions 
+
+```{r predictions}
+pred_linear_full    <- predict(linear,  newdata = test.data.linear)   # caret lm, all features
+ridge_predictions   <- predict(ridge,   newdata = test.data.linear)
+lasso_predictions   <- predict(lasso,   newdata = test.data.linear)
+elastic_predictions <- predict(elastic, newdata = test.data.linear)
+```
+
+### Model Comparison
+
+```{r hyperparameter-comparison}
+set.seed(777)
+linear_baseline_cv <- train(
+  price ~ depth + width + height + category + designer + other_colors,
+  data = train.data.linear,
+  method = "lm",
+  trControl = ctrl
+)
+
+all_models <- list(
+  `Linear (baseline)`     = linear_baseline_cv,
+  `Linear (all features)` = linear,
+  Ridge                   = ridge,
+  Lasso                   = lasso,
+  `Elastic Net`           = elastic
+)
+
+# Helper: metrics on any data set, on the original price scale (SR)
+get_metrics <- function(m, data) {
+  p <- predict(m, newdata = data)
+  tibble(
+    RMSE = RMSE(p, data$price),
+    MAE  = MAE(p, data$price),
+    R2   = R2(p, data$price)
+  )
+}
+
+hyperparams <- imap_dfr(all_models, \(m, name) {
+  if (m$method == "glmnet") {
+    best  <- m$bestTune
+    coefs <- coef(m$finalModel, s = best$lambda)
+    alpha <- best$alpha;  lambda <- best$lambda
+    nz    <- sum(coefs[-1] != 0);  total <- length(coefs) - 1
+  } else {                                   # unpenalised lm
+    coefs <- coef(m$finalModel)
+    alpha <- NA;  lambda <- 0
+    nz    <- sum(!is.na(coefs[-1]));  total <- length(coefs) - 1
+  }
+
+  tr <- get_metrics(m, train.data.linear)
+  te <- get_metrics(m, test.data.linear)
+  cv <- getTrainPerf(m)
+
+  tibble(
+    Model            = name,
+    alpha            = alpha,
+    lambda           = lambda,
+    `Train RMSE`     = tr$RMSE,
+    `CV RMSE`        = cv$TrainRMSE,
+    `Test RMSE`      = te$RMSE,
+    `Train MAE`      = tr$MAE,
+    `CV MAE`         = cv$TrainMAE,
+    `Test MAE`       = te$MAE,
+    `Train R2`       = tr$R2,
+    `CV R2`          = cv$TrainRsquared,
+    `Test R2`        = te$R2,
+    `Non-zero coefs` = nz,
+    `Total coefs`    = total
+  )
+}) |>
+  mutate(across(where(is.numeric), \(x) round(x, 3)))
+
+# Performance only
+hyperparams |> select(Model, matches("RMSE"), matches("MAE"), matches("R2"))
+
+# Tuning only
+hyperparams |> select(Model, alpha, lambda, `Non-zero coefs`, `Total coefs`)
+```
+
+```{r model-comparison}
+model_comparison <- bind_rows(
+  `Linear (baseline)`     = eval_metrics(actual, pred_linear),
+  `Log-linear`            = eval_metrics(actual, pred_log),
+  `Linear (all features)` = eval_metrics(actual, pred_linear_full),
+  Ridge                   = eval_metrics(actual, ridge_predictions),
+  Lasso                   = eval_metrics(actual, lasso_predictions),
+  `Elastic Net`           = eval_metrics(actual, elastic_predictions),
+  .id = "Model"
+)
+
+model_comparison
+```
+
+```{r negative-predictions}
+sapply(list(Linear         = pred_linear,
+            `Log-linear`   = pred_test_log,
+            `Linear (all)` = pred_linear_full,
+            Ridge          = ridge_predictions,
+            Lasso          = lasso_predictions,
+            `Elastic Net`  = elastic_predictions),
+       \(p) sum(p < 0))
+
+nrow(test.data.linear)
+```
+
+```{r actual-vs-pred-comparison}
+plot_data <- data.frame(
+  Actual = test.data.linear$price,
+  `All-features linear` = pred_linear_full,
+  `Log-linear` = pred_test_log,
+  check.names = FALSE
+) %>%
+  pivot_longer(
+    cols = c(`All-features linear`, `Log-linear`),
+    names_to = "Model",
+    values_to = "Predicted"
+  ) %>%
+  filter(
+    is.finite(Actual),
+    is.finite(Predicted)
+  ) %>%
+  mutate(
+    Model = factor(
+      Model,
+      levels = c("All-features linear", "Log-linear")
+    )
+  )
+
+# Shared limits across both panels
+axis_limits <- range(
+  c(plot_data$Actual, plot_data$Predicted),
+  na.rm = TRUE
+)
+
+prediction_plot <- ggplot(
+  plot_data,
+  aes(x = Actual, y = Predicted, colour = Model)
+) +
+  geom_abline(
+    intercept = 0,
+    slope = 1,
+    linetype = "dashed",
+    linewidth = 0.6,
+    colour = "grey50"
+  ) +
+  geom_point(
+    alpha = 0.45,
+    size = 1.6
+  ) +
+  facet_wrap(~ Model, nrow = 1) +
+  scale_colour_manual(
+    values = c(
+      "All-features linear" = "#006AA7",
+      "Log-linear" = "#FECC02"
+    )
+  ) +
+  coord_equal(
+    xlim = axis_limits,
+    ylim = axis_limits
+  ) +
+  labs(
+    title = "Actual vs Predicted Product Prices",
+    x = "Actual price (SR)",
+    y = "Predicted price (SR)"
+  ) +
+  theme_minimal(
+    base_family = "Times New Roman",
+    base_size = 12
+  ) +
+  theme(
+    plot.title.position = "plot",
+    plot.title = element_text(
+      family = "Times New Roman",
+      face = "bold",
+      size = 15.5,
+      hjust = 0.5,
+      margin = margin(t = 5, b = 18)
+    ),
+    axis.title.x = element_text(
+      size = 12,
+      margin = margin(t = 10)
+    ),
+    axis.title.y = element_text(
+      size = 12,
+      margin = margin(r = 10)
+    ),
+    axis.text = element_text(
+      size = 10,
+      colour = "black"
+    ),
+    strip.text = element_text(
+      family = "Times New Roman",
+      face = "bold",
+      size = 11,
+      colour = "black"
+    ),
+    strip.background = element_blank(),
+    panel.grid.major = element_line(
+      linewidth = 0.25,
+      colour = "grey88"
+    ),
+    panel.grid.minor = element_blank(),
+    legend.position = "none",
+    panel.spacing = unit(1.2, "lines"),
+    plot.margin = margin(15, 15, 15, 15)
+  )
+
+prediction_plot
+```
+```{r}
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(grid)
+
+# Actual test-set prices
+actual <- test.data.linear$price
+
+# All prediction vectors must be in the same row order as actual
+predictions <- list(
+  "Baseline linear"    = pred_linear,
+  "Log-linear"         = pred_test_log,
+  "All-features linear" = pred_linear_full,
+  "Ridge"              = ridge_predictions,
+  "Lasso"              = lasso_predictions,
+  "Elastic Net"        = elastic_predictions
+)
+
+# Keep only observations with complete actual/predicted values
+valid <- is.finite(actual) &
+  Reduce(`&`, lapply(predictions, is.finite))
+
+actual <- actual[valid]
+predictions <- lapply(predictions, `[`, valid)
+
+# Bootstrap confidence intervals
+set.seed(123)
+B <- 2000
+
+bootstrap_metrics <- map_dfr(names(predictions), function(model) {
+
+  pred <- predictions[[model]]
+
+  # Error metrics for the original test sample
+  rmse <- sqrt(mean((actual - pred)^2))
+  mae  <- mean(abs(actual - pred))
+
+  # Resample test observations, preserving actual-prediction pairs
+  boot_values <- replicate(B, {
+    idx <- sample(seq_along(actual), replace = TRUE)
+    c(
+      RMSE = sqrt(mean((actual[idx] - pred[idx])^2)),
+      MAE  = mean(abs(actual[idx] - pred[idx]))
+    )
+  })
+
+  tibble(
+    Model = model,
+    Metric = c("RMSE", "MAE"),
+    Estimate = c(rmse, mae),
+    CI_lower = c(
+      quantile(boot_values["RMSE", ], 0.025),
+      quantile(boot_values["MAE", ], 0.025)
+    ),
+    CI_upper = c(
+      quantile(boot_values["RMSE", ], 0.975),
+      quantile(boot_values["MAE", ], 0.975)
+    )
+  )
+})
+
+# Order models by RMSE, with lowest at the top
+model_order <- bootstrap_metrics %>%
+  filter(Metric == "RMSE") %>%
+  arrange(Estimate) %>%
+  pull(Model)
+
+bootstrap_metrics <- bootstrap_metrics %>%
+  mutate(
+    Model = factor(Model, levels = rev(model_order)),
+    Metric = factor(Metric, levels = c("RMSE", "MAE"))
+  )
+
+error_plot <- ggplot(
+  bootstrap_metrics,
+  aes(x = Estimate, y = Model)
+) +
+  geom_errorbarh(
+    aes(xmin = CI_lower, xmax = CI_upper),
+    colour = "grey40",
+    height = 0.12,
+    linewidth = 0.7
+  ) +
+  geom_point(
+    aes(colour = Metric),
+    size = 3
+  ) +
+  facet_grid(
+    Metric ~ .,
+    scales = "free_x",
+    space = "free_y"
+  ) +
+  scale_colour_manual(
+    values = c(
+      "RMSE" = "#d41243",
+      "MAE" = "#7eb0ea"
+    )
+  ) +
+  labs(
+    title = "Test-Set Prediction Error Across Models",
+    x = "Prediction error (SR), with 95% bootstrap CI",
+    y = NULL
+  ) +
+  theme_minimal(
+    base_family = "Times New Roman",
+    base_size = 12
+  ) +
+  theme(
+    plot.title.position = "plot",
+    plot.title = element_text(
+      family = "Times New Roman",
+      face = "bold",
+      size = 15.5,
+      hjust = 0.5,
+      margin = margin(t = 5, b = 18)
+    ),
+    axis.title.x = element_text(
+      size = 12,
+      margin = margin(t = 10)
+    ),
+    axis.text.y = element_text(
+      size = 10.5,
+      colour = "black"
+    ),
+    axis.text.x = element_text(
+      size = 10,
+      colour = "black"
+    ),
+    strip.placement = "outside",
+    strip.text.y.left = element_text(
+      family = "Times New Roman",
+      face = "bold",
+      size = 11,
+      angle = 90,
+      colour = "black",
+      margin = margin(r = 10)
+    ),
+    panel.grid.major.y = element_line(
+      linewidth = 0.25,
+      colour = "grey88"
+    ),
+    panel.grid.major.x = element_line(
+      linewidth = 0.25,
+      colour = "grey88"
+    ),
+    panel.grid.minor = element_blank(),
+    panel.border = element_blank(),
+    legend.position = "none",
+    panel.spacing.y = unit(0, "lines"),
+    plot.margin = margin(15, 15, 15, 15)
+  )
+
+error_plot
+```
+
+The Lasso and ElasticNet models do not shrink any coefficients to zero, thus all three regularised models retain every feature. The ElasticNet model (α = 0.8, λ = 0.53) behaves more similar to Lasso (α = 1.0, λ = 0.46) than to Ridge (α = 0.0, λ = 93.26). The ElasticNet and the Lasso models have very small lambda values which are too weak to remove any features. None of the models have lambda values at the borders, indicating the correct lambda value is included in the given range. Cross-validated RMSE is almost identical across the three regularised models (760.6–766.4 SR) and the unpenalised linear model with the same features also falls within that range (760.7 SR), indicating that regularisation provides little benefit. This is expected due to the large number of observations relative to predictors. 
+
+When large errors are penalised more heavily, ElasticNet (RMSE = 799.5 SR), Lasso (RMSE = 799.6 SR), and Linear (all features) (RMSE = 800.4 SR) models perform the best, followed closely by Ridge (RMSE = 802.6 SR). All four models include volume and the dimensions in both raw and logged forms, and account for a similar share of the variance in test-set prices (69.4-69.7%). The log-linear model has the lowest average error (MAE = 469.3 SR) but the highest RMSE (878.5 SR), reflecting a small number of large errors.
+
+There is no clearly defined best model, with Lasso, Ridge, ElasticNet and the Linear (all features) models performing comparatively well across metrics with a difference of errors under 4 SR. All four improve on the baseline model (RMSE = 821.1 SR), and since the unpenalised Linear (all features) model performs as well as the regularised ones, this improvement comes from the addition of size features (log-transformed dimensions, volume and sellable_online). All models except the log-linear model predict a negative price of between 84 and 102 of 736 (11.4%-13.9%). 
+
+### Conclusions
+
+#### Most Important Predictors
+
+The product's size, category and designer are the main predictors of price. In the log-linear model, all three dimensions are significant, with width having the largest elasticity. Category matters for items of the same size, children’s furniture is 55% cheaper than tables and desks, and four other categories are 40% or more cheaper (see Log-Transformed Model). Colour availability is not significant once size and category are controlled for. 
+
+#### Best Model on Test Set
+
+The Elastic Net, Lasso, Ridge and the unpenalised all features model have cross-validated RMSEs that are within 0.8% of one another, and therefore are effectively tied as the best model. The training, cross-validated and test errors differ by similar amounts across all models so there is no evidence any overfit. The test error is higher than the cross-validated error for all models, which could be due to the test set containing more expensive items which are harder to predict. 
+
+The Linear (all features) model is recommended as the final predictive model as it performs as well as the regularised models and is the simplest. If however, average accuracy or not predicting negative prices is more important than avoiding large errors, the Log-linear model should be selected. 
+
+#### Limitations
+
+The model has large errors relative to the average prices (RMSE of about 800 SR against a mean of 1,078 and a median of 545). Heteroscedasticity still exists, with the variance growing with price resulting in the under-prediction of expensive items. Additionally, the raw baseline model sometimes predicts negative prices (102 of 736 test items), and the log model under-predicts items with very small dimensions. The linear model also does not satisfy the linearity or normality of residuals assumptions. Independence is assumed, however, could be violated by products released as part of the same collection or designer sharing unobserved characteristics.
+
+As the raw, log and volume terms are collinear, individual size coefficients can't be interpreted. Finally, the evaluation is based in a singular train/test split. 
+
+## Model 2: Identifying Discounted Products
+
+As the target variable is binary (discounted or not discounted), a logit model was built to predict the likelihood of a product being placed on sale.
+
+### Preparing data
+
+```{r logit-prep}
+ikea_logit <- ikea_model |> 
+  select(-old_price)
+
+# Target
+table(ikea_logit$discounted, useNA = "ifany")
+```
+
+### Train-test split
+
+```{r}
+set.seed(777)
+
+training.samples <- ikea_logit$discounted |> 
+  createDataPartition(p = 0.8, list = FALSE)
+
+train.data.logit <- ikea_logit[training.samples, ]
+test.data.logit  <- ikea_logit[-training.samples, ]
+truth <- test.data.logit$discounted   # levels: "no", "yes"
+```
+
+### Logit Model
+
+```{r logit-model}
+set.seed(777)
+
+logit_model <- glm(
+  discounted ~ . - log_price,
+  data = train.data.logit,
+  family = binomial
+)
+
+summary(logit_model)
+
+round(exp(coef(logit_model)), 2)
+```
+
+Holding all other variables constant, the odds of a product being discounted are higher than for the reference category 'Tables & desks' for 'Beds' (85% higher, OR = 1.85), 'Wardrobes' (125% higher, OR = 2.25) and 'Chests of drawers & drawer units' (227% higher, OR = 3.27). Items available in other colours have 30% lower odds of being discounted (OR = 0.70).
+
+Compared to the reference designer IKEA of Sweden, products by Ola Wihlborg have the highest odds of discount (634% higher, OR = 7.34), followed by Henrik Preutz (315% higher, OR = 4.15), E Lilja Löwenhielm/K Malmvall (280% higher, OR = 3.80), Ehlén Johansson (276% higher, OR = 3.76) and Francis Cayouette (149% higher, OR = 2.49). Products by designers grouped as 'Other' have 86% higher odds (OR = 1.86). K Hagberg/M Hagberg is the only designer with significantly lower odds (65% lower, OR = 0.35). 
+
+Depth, height, width and volume are all individually significant, but as volume is a product of the three dimensions the coefficients offset one another and cannot be interpreted in isolation. The log-transformed dimensions are not significant. Price is not a statistically significant predictor of discount (p = 0.42) once the other variables are controlled for.
+
+A small number of designer and category levels (e.g. 'Sideboards, buffets & console tables') have almost no discounted observations in the training data so their estimates are unstable and cannot be interpreted.
+
+#### Logit Reduced
+
+A model with only the raw dimension terms is run in order to isolate the effect of size. 
+
+```{r logit-reduced}
+set.seed(777)
+
+logit_model_reduced <- glm(
+  discounted ~ . - log_price - log_width - log_depth - log_height - volume,
+  data = train.data.logit,
+  family = binomial
+)
+
+summary(logit_model_reduced)
+
+round(exp(coef(logit_model_reduced)), 2)
+```
+
+```{r}
+logit_reduced <- logit_model_reduced
+anova(logit_reduced, logit_model, test = "Chisq")   # likelihood ratio test
+AIC(logit_reduced, logit_model); BIC(logit_reduced, logit_model)
+
+p_red  <- predict(logit_reduced, test.data.logit, type = "response")
+p_full <- predict(logit_model,   test.data.logit, type = "response")
+
+r_red  <- roc(truth, p_red,  levels = c("no","yes"), direction = "<")
+r_full <- roc(truth, p_full, levels = c("no","yes"), direction = "<")
+auc(r_red); auc(r_full)
+roc.test(r_red, r_full, method = "delong", paired = TRUE)
+```
+
+Removing the log-transformed dimensions and volume reduced the number of parameters from 49 to 45. Width is the only significant size feature that remains significant in the model. Holding other variables constant, each additional centimetre of width is associated with around a 0.4% increase in the odds of an item being discounted. 
+
+A likelihood ratio test favoured the full model on the training data (χ² = 19.88, df = 4, p < 0.001), as did AIC (2400.9 vs 2412.7), while BIC favoured the reduced model (2682.4 vs 2694.4). On the test set, the reduced model achieved a slightly higher AUC (0.753 vs 0.746), though a DeLong test found no significant difference (p = 0.368). The full specification is retained for the following models.
+
+#### Prediction
+
+```{r classification-predictions}
+# Predictions
+probabilities <- logit_model |>
+  predict(test.data.logit, type = "response")
+
+# select the classification threshold
+predicted.classes <- ifelse(probabilities > 0.5, "yes", "no")
+predicted.classes <- factor(predicted.classes, levels = c("no","yes")) ## factored
+```
+
+#### Evaluation
+
+Confusion matrix & derived metrics
+
+```{r confusion-matrix}
+# Factoring 'discounted' on the test data
+test.data.logit$discounted <- factor(
+  test.data.logit$discounted,
+  levels = c("no", "yes"))
+
+confusionMatrix(
+  predicted.classes,
+  test.data.logit$discounted,
+  positive = "yes")
+```
+
+The model has a 84.15% accuracy rate, which is not significantly different to a model with no information (82.38%). This occurs as only 130 out of 738 items were discounted (17.62%), so a model that always guesses the item is not discounted achieves this accuracy level. The model's specificity is very high (98.85%), but its sensitivity is low (15.39%) as it correctly identifies only 20 of the 130 discounted products. When it does predict a discount it is usually correct (precision = 74.07%), but it makes such a prediction rarely (27 of 738 products). The balanced accuracy of 57.11% and kappa of 0.21 also suggest that performance is only marginally better than chance once class imbalance is accounted for. This is largely due to the default 0.5 classification threshold, which is too high for a dataset with this level of class imbalance. 
+
+### Improved Threshold 
+
+```{r roc-auc}
+roc <- roc(
+  test.data.logit$discounted,
+  probabilities)
+
+pROC::ggroc(roc)
+auc(roc)
+```
+
+```{r}
+# Predicted probabilities on the training data
+train_prob <- predict(logit_model, train.data.logit, type = "response")
+
+# ROC on training data
+roc_train <- roc(train.data.logit$discounted, train_prob,
+                 levels = c("no", "yes"), direction = "<")
+
+# Best threshold by Youden's J
+best <- coords(roc_train, "best", best.method = "youden",
+               ret = c("threshold", "sensitivity", "specificity"))
+
+thr <- best$threshold[1]
+
+# Applied to the test set
+test_prob <- predict(logit_model, test.data.logit, type = "response")
+pred_new <- factor(ifelse(test_prob > thr, "yes", "no"), levels = c("no", "yes"))
+
+confusionMatrix(pred_new, test.data.logit$discounted, positive = "yes")
+
+# Alternate options 
+coords(roc_train, x = seq(0.10, 0.50, by = 0.05), input = "threshold",
+       ret = c("threshold", "sensitivity", "specificity", "ppv", "npv"))
+```
+
+Using the threshold that maximises Youden's J (0.17), sensitivity rises from 15.4% to 67.7% and specificity falls from 98.8% to 66.6%, balancing out the two values. The model correctly identifies 88 of the 130 discounted products (previously 20). Balanced accuracy improves from 57.1% to 67.2% and kappa from 0.21 to 0.23, however, overall accuracy falls to 66.8%, below the 82.4% no information rate. Precision also drops to 30.2% (previously 74.07%), so the probability of correctly identifying a discount has fallen dramatically. This threshold is therefore preferable when missing a discounted item is more costly than a false prediction, while the 0.5 threshold is better for cases when the prediction of a discount needs to be reliable. 
+
+### Penalised Logstic Regression
+
+#### Preparation
+
+```{r class-set-up}
+# Cross-validation set up
+ctrl_class <- trainControl(
+  method = "cv",
+  number = 5,
+  classProbs = TRUE,
+  summaryFunction = twoClassSummary # binary classification
+)
+
+# Potential lambda values
+lambda <- 10^seq(-3, 1, length = 100)
+
+# ROC plus Sens/Spec with "yes" as the positive class
+yes_summary <- function(data, lev = NULL, model = NULL) {
+  c(ROC  = twoClassSummary(data, lev = lev, model = model)[["ROC"]],
+    Sens = caret::sensitivity(data$pred, data$obs, positive = "yes"),
+    Spec = caret::specificity(data$pred, data$obs, negative = "no"))
+}
+
+ctrl_class <- trainControl(
+  method = "cv",
+  number = 5,
+  classProbs = TRUE,
+  summaryFunction = yes_summary
+)
+
+# Potential lambda values
+lambda <- 10^seq(-3, 1, length = 100)
+```
+
+
+#### Baseline Logistic Model
+
+Baseline model calculated using caret.
+
+```{r}
+set.seed(777)
+
+logistic_base <- train(
+  discounted ~ . - log_price,
+  data = train.data.logit,
+  method = "glm",
+  family = "binomial",
+  trControl = ctrl_class,
+  metric = "ROC",
+  preProc = c("scale"))
+
+logistic_base
+```
+
+#### Lasso Model
+
+```{r class-lasso}
+set.seed(777)
+
+logistic_lasso <- train(
+  discounted ~ . - log_price,
+  data = train.data.logit,
+  method = "glmnet",
+  family = "binomial",
+  trControl = ctrl_class,
+  tuneGrid = expand.grid(
+    alpha = 1,
+    lambda = lambda
+  ),
+  metric = "ROC",
+  preProc = c("scale")
+)
+
+logistic_lasso
+```
+
+#### Ridge Model
+
+```{r class-ridge}
+set.seed(777)
+
+# Model
+logistic_ridge <- train(
+  discounted ~ . - log_price,
+  data = train.data.logit,
+  method = "glmnet",
+  family = "binomial",
+  trControl = ctrl_class,
+  tuneGrid = expand.grid(
+    alpha = 0,        # Ridge
+    lambda = lambda),
+  metric = "ROC",
+  preProc = c("scale")
+)
+
+logistic_ridge
+
+# Best lambda
+logistic_ridge$bestTune$lambda
+```
+
+#### ElasticNet Model
+
+```{r class-elasticnet}
+set.seed(777)
+
+logistic_elastic <- train(
+  discounted ~ . - log_price,
+  data = train.data.logit,
+  method = "glmnet",
+  family = "binomial",
+  trControl = ctrl_class,
+  tuneGrid = expand.grid(
+    alpha  = seq(0, 1, by = 0.1),
+    lambda = lambda),
+  metric = "ROC",
+  preProc = c("scale")
+)
+
+logistic_elastic$bestTune
+
+logit_prob_elastic <- predict(logistic_elastic, test.data.logit, type = "prob")[, "yes"]
+```
+
+#### Prediction
+
+```{r class-pred}
+# Predict probabilities
+logit_prob_base <- predict(logistic_base, test.data.logit, type = "prob")[, "yes"]
+logit_prob_lasso <- predict(logistic_lasso, test.data.logit, type = "prob")[, "yes"]
+logit_prob_ridge <- predict(logistic_ridge, test.data.logit, type = "prob")[, "yes"]
+logit_prob_elastic <- predict(logistic_elastic, test.data.logit, type = "prob")[, "yes"]
+```
+
+### Evaluation and Comparison
+
+```{r class-evaluation-setup}
+# Test-set probabilities
+prob_list <- list(
+  Logistic = logit_prob_base,
+  Lasso    = logit_prob_lasso,
+  Ridge    = logit_prob_ridge,
+  Elastic  = logit_prob_elastic
+)
+
+# Helper: class predictions at a threshold -> confusion matrix object
+cm_at_threshold <- function(prob, truth, threshold) {
+  pred <- factor(ifelse(prob > threshold, "yes", "no"), levels = c("no", "yes"))
+  confusionMatrix(pred, truth, positive = "yes")
+}
+```
+
+```{r class-confusion-matrix}
+cms <- map(prob_list, cm_at_threshold, truth = truth, threshold = thr)
+
+# Print
+walk2(cms, names(cms), \(cm, nm) {
+  cat("\n=====", nm, "(threshold =", round(thr, 3), ") =====\n")
+  print(cm$table)
+})
+```
+```{r class-comparison}
+threshold_comparison <- imap_dfr(cms, \(cm, nm) {
+  tibble(
+    Model               = nm,
+    Threshold           = thr,
+    Sensitivity         = cm$byClass[["Sensitivity"]],
+    Specificity         = cm$byClass[["Specificity"]],
+    `Balanced accuracy` = cm$byClass[["Balanced Accuracy"]],
+    Precision           = cm$byClass[["Pos Pred Value"]],
+    Accuracy            = cm$overall[["Accuracy"]],
+    Kappa               = cm$overall[["Kappa"]],
+    AUC                 = as.numeric(roc(truth, prob_list[[nm]],
+                                         levels = c("no", "yes"))$auc)
+  )
+}) |>
+  mutate(across(where(is.numeric), \(x) round(x, 3)))
+
+threshold_comparison
+```
+
+```{r tests}
+# CV ROC (same seed before each train() = shared folds)
+rs_class <- resamples(list(Logistic = logistic_base, Lasso = logistic_lasso,
+                           Ridge = logistic_ridge, Elastic = logistic_elastic))
+summary(rs_class)$statistics$ROC
+summary(diff(rs_class))
+
+# Paired DeLong tests against the plain logistic model
+roc_logit   <- roc(truth, logit_prob_base,    levels = c("no","yes"), direction = "<")
+roc_lasso   <- roc(truth, logit_prob_lasso,   levels = c("no","yes"), direction = "<")
+roc_ridge   <- roc(truth, logit_prob_ridge,   levels = c("no","yes"), direction = "<")
+roc_elastic <- roc(truth, logit_prob_elastic, levels = c("no","yes"), direction = "<")
+
+ci.auc(roc_logit); ci.auc(roc_lasso); ci.auc(roc_ridge); ci.auc(roc_elastic)
+
+roc.test(roc_logit, roc_lasso,   method = "delong", paired = TRUE)
+roc.test(roc_logit, roc_ridge,   method = "delong", paired = TRUE)
+roc.test(roc_logit, roc_elastic, method = "delong", paired = TRUE)
+
+# Train vs test AUC
+auc_on <- function(m, data) {
+  p <- predict(m, data, type = "prob")[, "yes"]
+  as.numeric(auc(roc(data$discounted, p, levels = c("no","yes"), direction = "<")))
+}
+models <- list(Logistic = logistic_base, Lasso = logistic_lasso,
+               Ridge = logistic_ridge, Elastic = logistic_elastic)
+tibble(Model = names(models),
+       Train = map_dbl(models, auc_on, data = train.data.logit),
+       Test  = map_dbl(models, auc_on, data = test.data.logit))
+```
+
+```{r}
+logistic_elastic$bestTune
+```
+```{r roc-curves-comparison}
+# Actual test-set outcome (factor with levels "no" / "yes")
+actual <- test.data.logit$discounted
+
+test_probs <- list(
+  "Baseline logistic" = logit_prob_base,
+  "Ridge"             = logit_prob_ridge,
+  "Lasso"             = logit_prob_lasso,
+  "Elastic Net"       = logit_prob_elastic
+)
+
+# Same complete test observations for every model
+valid <- !is.na(actual) & actual %in% c("no", "yes") &
+  Reduce(`&`, lapply(test_probs, is.finite))
+
+actual     <- actual[valid]
+test_probs <- lapply(test_probs, `[`, valid)
+
+# ROC coordinates and AUC for each model, with the legend label built in
+roc_data <- map_dfr(names(test_probs), function(model) {
+  roc_obj <- pROC::roc(
+    response  = actual,
+    predictor = test_probs[[model]],
+    levels    = c("no", "yes"),
+    direction = "<",
+    quiet     = TRUE
+  )
+  auc_val <- as.numeric(pROC::auc(roc_obj))
+
+  tibble(
+    Model  = model,
+    FPR    = 1 - roc_obj$specificities,
+    TPR    = roc_obj$sensitivities,
+    AUC    = auc_val,
+    Legend = sprintf("%s (AUC = %.3f)", model, auc_val)
+  )
+})
+
+# Colours and line types named by the legend label, not by model name
+model_cols <- c("Baseline logistic" = "#d41243", "Ridge" = "#7eb0ea",
+                "Lasso" = "#d896ff", "Elastic Net" = "#6f8f72")
+model_lty  <- c("Baseline logistic" = "solid", "Ridge" = "solid",
+                "Lasso" = "solid", "Elastic Net" = "dashed")
+
+legend_tbl  <- distinct(roc_data, Model, Legend)
+roc_data$Legend <- factor(roc_data$Legend, levels = legend_tbl$Legend)
+
+legend_cols <- setNames(model_cols[legend_tbl$Model], legend_tbl$Legend)
+legend_lty  <- setNames(model_lty[legend_tbl$Model],  legend_tbl$Legend)
+
+roc_plot <- ggplot(roc_data, aes(x = FPR, y = TPR,
+                                 colour = Legend, linetype = Legend)) +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed",
+              linewidth = 0.6, colour = "grey55") +
+  geom_path(linewidth = 0.9) +
+  scale_colour_manual(values = legend_cols, name = NULL) +
+  scale_linetype_manual(values = legend_lty, name = NULL) +
+  coord_equal(xlim = c(0, 1), ylim = c(0, 1)) +
+  labs(
+    title = "ROC Curves for Discount Classification",
+    x = "False positive rate (1 − specificity)",
+    y = "True positive rate (sensitivity)"
+  ) +
+  theme_minimal(base_family = "serif", base_size = 12) +
+  theme(
+    plot.title.position = "plot",
+    plot.title   = element_text(face = "bold", size = 15.5, hjust = 0.5,
+                                margin = margin(t = 5, b = 18)),
+    axis.title.x = element_text(margin = margin(t = 10)),
+    axis.title.y = element_text(margin = margin(r = 10)),
+    axis.text    = element_text(colour = "black", size = 10),
+    panel.grid.major = element_line(linewidth = 0.25, colour = "grey88"),
+    panel.grid.minor = element_blank(),
+    legend.position  = "bottom",
+    legend.text      = element_text(size = 10),
+    legend.key.width = unit(1.2, "cm"),
+    plot.margin      = margin(15, 15, 15, 15)
+  )
+
+roc_plot
+```
+
+
+```{r}
+# Dara
+thr_cols <- c("Default (0.5)" = "#006AA7", "Youden (0.175)" = "#FECC02")
+actual01 <- as.integer(truth == "yes")
+prevalence <- mean(actual01)
+
+# Precision-recall curve (starts at recall 0, precision 1)
+pr_df <- tibble(actual = actual01, prob = logit_prob_base) %>%
+  arrange(desc(prob)) %>%
+  transmute(Recall    = cumsum(actual) / sum(actual),
+            Precision = cumsum(actual) / row_number()) %>%
+  add_row(Recall = 0, Precision = 1, .before = 1)
+
+# Operating points at the two thresholds
+op_points <- imap_dfr(c("Default (0.5)" = 0.5, "Youden (0.175)" = thr), \(t, nm) {
+  cm <- cm_at_threshold(logit_prob_base, truth, t)
+  tibble(Threshold = nm,
+         Recall    = cm$byClass[["Sensitivity"]],
+         Precision = cm$byClass[["Pos Pred Value"]])
+}) %>%
+  mutate(Threshold = factor(Threshold, levels = names(thr_cols)),
+         label = sprintf("Recall = %.1f%%\nPrecision = %.1f%%", 100 * Recall, 100 * Precision))
+
+# Plot
+pr_plot <- ggplot(pr_df, aes(Recall, Precision)) +
+  geom_hline(yintercept = prevalence, linetype = "dashed", linewidth = 0.7, colour = "grey50") +
+  annotate("text", x = 0.98, y = prevalence - 0.04, hjust = 1, size = 4.5,
+           family = "serif", colour = "grey30",
+           label = sprintf("Prevalence = %.1f%%", 100 * prevalence)) +
+  geom_step(colour = "#d41243", linewidth = 0.9, direction = "hv") +
+  geom_segment(data = op_points, aes(x = Recall, xend = Recall, y = 0, yend = Precision, colour = Threshold),
+               linetype = "dashed", linewidth = 0.8, inherit.aes = FALSE) +
+  geom_segment(data = op_points, aes(x = 0, xend = Recall, y = Precision, yend = Precision, colour = Threshold),
+               linetype = "dashed", linewidth = 0.8, inherit.aes = FALSE) +
+  geom_point(data = op_points, aes(x = Recall, y = Precision, fill = Threshold),
+           shape = 21, colour = "black", size = 4.5, stroke = 0.8,
+           inherit.aes = FALSE) +
+  geom_label(data = op_points, aes(x = Recall + 0.035, y = Precision + 0.03, label = label),
+             hjust = 0.3, vjust = 0, size = 4.2, family = "serif", lineheight = 0.95,
+             fill = scales::alpha("white", 0.85), label.size = 0, inherit.aes = FALSE) +
+  scale_colour_manual(values = thr_cols, name = NULL) +
+  scale_fill_manual(values = thr_cols, name = NULL) +
+  scale_x_continuous(limits = c(0, 1), breaks = seq(0, 1, 0.2), expand = expansion(mult = c(0, 0.02))) +
+  scale_y_continuous(limits = c(0, 1), breaks = seq(0, 1, 0.2), expand = expansion(mult = c(0, 0.02))) +
+  labs(title = "Precision–Recall Curve for Discount Classification",
+       subtitle = "Baseline logistic model, test set",
+       x = "Recall (sensitivity)", y = "Precision") +
+  theme_minimal(base_family = "serif", base_size = 13) +
+  theme(plot.title.position = "plot",
+        plot.title    = element_text(face = "bold", size = 16.5, hjust = 0.5, margin = margin(t = 5, b = 4)),
+        plot.subtitle = element_text(hjust = 0.5, colour = "grey35", size = 12, margin = margin(b = 14)),
+        axis.title.x  = element_text(margin = margin(t = 10)),
+        axis.title.y  = element_text(margin = margin(r = 10)),
+        axis.text     = element_text(colour = "black", size = 11),
+        panel.grid.major = element_line(linewidth = 0.25, colour = "grey88"),
+        panel.grid.minor = element_blank(),
+        legend.position = "bottom", legend.text = element_text(size = 11),
+        plot.margin = margin(15, 15, 15, 15))
+
+pr_plot
+```
+
+```{r threshold-comparison}
+truth <- test.data.logit$discounted   # factor: "no" / "yes"
+
+thresholds <- c("Default (0.5)" = 0.5,
+                "Youden (0.175)" = thr)
+
+metrics_df <- imap_dfr(thresholds, \(t, nm) {
+  cm <- cm_at_threshold(logit_prob_base, truth, t)
+  tibble(
+    Threshold          = nm,
+    Sensitivity        = cm$byClass[["Sensitivity"]],
+    Specificity        = cm$byClass[["Specificity"]],
+    Precision          = cm$byClass[["Pos Pred Value"]],
+    `Balanced accuracy`= cm$byClass[["Balanced Accuracy"]],
+    Accuracy           = cm$overall[["Accuracy"]]
+  )
+}) |>
+  pivot_longer(-Threshold, names_to = "Metric", values_to = "Value") |>
+  mutate(
+    Metric    = factor(Metric, levels = c("Sensitivity", "Specificity", "Precision",
+                                          "Balanced accuracy", "Accuracy")),
+    Threshold = factor(Threshold, levels = names(thresholds))
+  )
+
+threshold_plot <- ggplot(metrics_df, aes(x = Metric, y = Value, fill = Threshold)) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.75) +
+  geom_text(aes(label = sprintf("%.1f%%", 100 * Value)),
+            position = position_dodge(width = 0.8),
+            vjust = -0.4, size = 3.3, family = "serif") +
+  scale_fill_manual(values = c("Default (0.5)" = "#006AA7",
+                               "Youden (0.175)" = "#FECC02"), name = NULL) +
+  scale_y_continuous(limits = c(0, 1.08), breaks = seq(0, 1, 0.2),
+                     labels = scales::percent_format(accuracy = 1),
+                     expand = expansion(mult = c(0, 0))) +
+  labs(title = "Effect of Classification Threshold on Model Performance",
+       subtitle = "Baseline logistic model, test set",
+       x = NULL, y = NULL) +
+  theme_minimal(base_family = "serif", base_size = 12) +
+  theme(
+    plot.title.position = "plot",
+    plot.title    = element_text(face = "bold", size = 15.5, hjust = 0.5,
+                                 margin = margin(t = 5, b = 4)),
+    plot.subtitle = element_text(hjust = 0.5, colour = "grey35",
+                                 margin = margin(b = 14)),
+    axis.text     = element_text(colour = "black", size = 10),
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor   = element_blank(),
+    panel.grid.major.y = element_line(linewidth = 0.25, colour = "grey88"),
+    legend.position = "bottom",
+    plot.margin   = margin(15, 15, 15, 15)
+  )
+
+threshold_plot
+```
+
+```{r}
+# ---- Data -------------------------------------------------------------------
+fit <- logit_model_reduced
+est <- summary(fit)$coefficients
+
+# Rescale continuous predictors so ORs are per interpretable unit
+unit <- c(width = 10, height = 10, depth = 10, price = 1000)
+
+forest_df <- tibble(term = rownames(est),
+                    beta = est[, "Estimate"],
+                    se   = est[, "Std. Error"],
+                    p    = est[, "Pr(>|z|)"]) %>%
+  filter(term != "(Intercept)") %>%
+  mutate(
+    k  = coalesce(unname(unit[term]), 1),
+    OR = exp(k * beta),
+    lo = exp(k * (beta - 1.96 * se)),
+    hi = exp(k * (beta + 1.96 * se)),
+    Significant = ifelse(p < 0.05, "Significant (p < 0.05)", "Not significant")
+  )
+
+# Omit unstable estimates (separation: huge SEs) and sellable_online
+n_omitted <- sum(forest_df$se >= 5 | forest_df$term == "sellable_onlineTRUE")
+
+forest_df <- forest_df %>%
+  filter(se < 5, term != "sellable_onlineTRUE") %>%
+  mutate(
+    Group = case_when(
+      str_starts(term, "category") ~ "Category (vs Tables & desks)",
+      str_starts(term, "designer") ~ "Designer (vs IKEA of Sweden)",
+      TRUE                         ~ "Size, colour and price"
+    ),
+    Label = case_when(
+      str_starts(term, "category") ~ str_remove(term, "^category"),
+      str_starts(term, "designer") ~ str_remove(term, "^designer"),
+      term == "other_colorsYes"    ~ "Other colours available (vs single colour)",
+      term == "width"              ~ "Width (per 10 cm)",
+      term == "height"             ~ "Height (per 10 cm)",
+      term == "depth"              ~ "Depth (per 10 cm)",
+      term == "price"              ~ "Price (per 1,000 SR)"
+    )
+  ) %>%
+  # show only significant designers, to keep the figure readable
+  filter(!(str_starts(term, "designer") & p >= 0.05)) %>%
+  mutate(Group = factor(Group, levels = c("Category (vs Tables & desks)",
+                                          "Designer (vs IKEA of Sweden)",
+                                          "Size, colour and price"))) %>%
+  arrange(Group, OR) %>%
+  mutate(Label = factor(Label, levels = unique(Label)),
+         Significant = factor(Significant,
+                              levels = c("Significant (p < 0.05)", "Not significant")))
+
+# Plot
+forest_plot <- ggplot(forest_df, aes(x = OR, y = Label)) +
+  geom_vline(xintercept = 1, linetype = "dashed", linewidth = 0.7, colour = "grey40") +
+  geom_linerange(aes(xmin = lo, xmax = hi), linewidth = 0.7, colour = "grey25") +
+  geom_point(aes(fill = Significant), shape = 21, colour = "black",
+             size = 4, stroke = 0.8) +
+  geom_text(aes(x = hi, label = sprintf("%.2f", OR)),
+            hjust = -0.3, size = 3.8, family = "serif", colour = "grey20") +
+  facet_grid(Group ~ ., scales = "free_y", space = "free_y") +
+  scale_x_log10(breaks = c(0.1, 0.25, 0.5, 1, 2, 4, 8, 16),
+                expand = expansion(mult = c(0.02, 0.12))) +
+  scale_fill_manual(values = c("Significant (p < 0.05)" = "#d41243",
+                               "Not significant"        = "white"), name = NULL) +
+  labs(title = "Odds Ratios for the Reduced Logistic Model",
+       subtitle = "Odds of a product being discounted, with 95% confidence intervals",
+       x = "Odds ratio (log scale; 1 = no effect)", y = NULL,
+       caption = str_wrap(sprintf(
+         "Wald 95%% confidence intervals. %d terms omitted: levels with almost no discounted products (unstable estimates) and sellable_online. Only significant designers are shown; 'Other' is a group of lumped designers.",
+         n_omitted), width = 110)) +
+  theme_minimal(base_family = "serif", base_size = 13) +
+  theme(
+    plot.title.position = "plot",
+    plot.title    = element_text(face = "bold", size = 16.5, hjust = 0.5,
+                                 margin = margin(t = 5, b = 4)),
+    plot.subtitle = element_text(hjust = 0.5, colour = "grey35", size = 12,
+                                 margin = margin(b = 14)),
+    plot.caption  = element_text(hjust = 0, colour = "grey35", size = 9.5,
+                                 margin = margin(t = 12)),
+    axis.title.x  = element_text(margin = margin(t = 10)),
+    axis.text     = element_text(colour = "black", size = 11),
+    strip.text.y  = element_text(angle = 0, hjust = 0, face = "bold", size = 11),
+    strip.background = element_rect(fill = "grey93", colour = NA),
+    panel.grid.major = element_line(linewidth = 0.25, colour = "grey88"),
+    panel.grid.minor = element_blank(),
+    panel.spacing.y  = unit(0.6, "lines"),
+    legend.position  = "bottom",
+    legend.text      = element_text(size = 11),
+    plot.margin   = margin(15, 15, 15, 15)
+  )
+
+forest_plot
+```
+
+All four models performed similarly at the Youden threshold of 0.175 (derived above). Sensitivity ranges from 67.7% to 70.0%, specificity from 65.3% to 66.6% and balanced accuracy from 66.8% to 67.6%. Mean cross-validated ROC is 0.717 to 0.719 across all four models and the test AUC is 0.746 for the logistic model, 0.745 for Lasso and 0.741 for Ridge and ElasticNet (ElasticNet is identical to Ridge due to setting alpha to 0). Paired DeLong tests found no significant difference in AUC between the logistic and regularised models (all p > 0.48), so it cannot be concluded that one model performs better than the other three. Therefore, there is no evidence that regularisation meaningfully improves classification.
+
+At this threshold, precision is around 30% for all models, meaning most predicted discounts are false alarms, and overall accuracy is below the 82.4% No Information Rate, reflecting the trade-off to detect discounted products with greater accuracy. 
+
+It is recommended to use the basic Logit model as the primary prediction model, for simplicity and interpretability as the model's accuracy does not differ from the regularised specifications. As all models have a test AUC which are statistically indistinguishable, none clearly generalise to unseen data better. Training AUC (0.747 to 0.753) is only slightly higher than test AUC (0.741 to 0.746), so there is no evidence of overfitting to the training data, and none of the models generalise better than the others. 
+
+## Conclusions
+
+This analysis developed two predictive models, one to predict an item's price and the other to predict whether a product will go on sale. 
+
+### Key insights
+
+Price is predicted reasonably well from the given product characteristics, with the best models explaining around 70% of the variance in test-set prices. An item's size, category and designer are the main predictors of its price. Models that included the log-transformed dimensions and volume improved on the baseline linear model, while regularisation added no meaningful benefit over the unpenalised model with the same features. The log-linear model gives the smallest amount of errors on average (lowest MAE) and no negative predictions, but larger numbers of higher-cost errors (highest RMSE). The all-features linear model is recommended for simplicity and model fit when it is important to minimise high-cost errors, and the log-linear model is recommended if higher overall accuracy is a priority. However for all models tested, errors remain large relative to prices.
+
+Discounts are harder to predict than price with the given data. At the default 0.5 threshold the model is not significantly better than always predicting a price will not be discounted, detecting only a small number of the discounted products. Choosing a threshold using Youden's J on the training data raises sensitivity substantially but at the cost of precision and overall accuracy. Discrimination is modest (AUC of around 0.75) and again, regularisation made no significant difference to model fit or accuracy so the basic all-features Logit model is recommended for simplicity and interpretability. 
+
+### Drivers of price vs. discounts
+
+Item price is driven mainly by physical characteristics, with larger products generally costing more and category dictating by how much for a given size. Discounts are driven much less by size, only having a significant relationship with width. Price itself was not a significant predictor of discounts once other variables were controlled for. Instead, discounts were associated with the product designer, category and colour availability. Compared to the in-house design team IKEA of Sweden, all significant designers except one increase the odds of a discount including the aggregated 'Other' category comprised of all designers below the 22 most prevalent.  
+
+Compared to the reference category of 'Tables & desks', 'Beds', 'Wardrobes', and 'Chests of drawers & drawer units' all have higher odds of a discount, and items available in several colours have lower odds. Designer and category matter for both price and discount but in separate ways, with the designers associated with price premiums largely different from those associated with higher discount odds. 
+
+### Pipeline
+
+The modelling pipeline follows a sequential and complete workflow: using exploratory analysis to inform preprocessing choices, testing assumptions for the linear models, tuning hyperparameters with cross-validation, and evaluating the models using a held-out test set. Models were compared using several metrics, and differences between classifiers were tested formally. The optimum classification threshold was selected by maximising Youden’s J statistic, although used training data only. Different model specifications gave consistent conclusions, increasing the robustness of the conclusions. 
+
+### Limitations
+
+Weaknesses of the pipeline include that results rely on a single train/test split and that linear model assumptions were violated. The baseline linear and regularised models predict negative prices, and the log-linear model under-predicts products with very small dimensions. Both the linear and log-linear models under-predict higher-priced items, with the log-linear model doing this more extremely. Additionally, the raw, log and volume features are collinear so the individual coefficients cannot be isolated and interpreted. 
+
+Some designer and category levels have a very low number of discounted observations which makes the estimates unstable. The threshold was calculated from the logistic model and applied to all classification models, and class imbalance was handled only through this threshold, not with resampling or weighting. Product names and descriptions were excluded but could contain predictive information. 
+
+### Potential Improvements
+
+Including data on the production costs such as material, labour, and transport, could help improve product price predictions. If these are not available, adding simpler metrics, such as the materials used, or country of manufacture, could potentially act as proxies. To improve discount predictions, data on when each product was first released, what season it was designed for, current stock levels and sales history would likely help, as would as time and location-specific data such as the time of year, store location and and warehouse capacity. Price history information would also help to distinguish permanent price cuts from temporary promotions. 
+
